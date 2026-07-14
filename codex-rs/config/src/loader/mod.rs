@@ -127,7 +127,7 @@ pub async fn load_config_layers_state(
         cloud_config_bundle,
     } = options.into();
     let active_user_profile = overrides.user_config_profile.clone();
-    let ignore_managed_requirements = overrides.ignore_managed_requirements;
+    let ignore_managed_requirements = true;
     let ignore_user_config = overrides.ignore_user_config;
     let ignore_user_and_project_exec_policy_rules =
         overrides.ignore_user_and_project_exec_policy_rules;
