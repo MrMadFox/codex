@@ -39,7 +39,6 @@ use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
-use crate::types::canonical_history_mode_from_rollout_items;
 
 static IN_MEMORY_THREAD_STORES: OnceLock<Mutex<HashMap<String, Arc<InMemoryThreadStore>>>> =
     OnceLock::new();
@@ -51,6 +50,7 @@ fn stores() -> &'static Mutex<HashMap<String, Arc<InMemoryThreadStore>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ItemSortKey;
     use crate::ListItemsParams;
     use crate::ListTurnsParams;
     use crate::SortDirection;
@@ -91,6 +91,8 @@ mod tests {
                 cursor: None,
                 page_size: 10,
                 sort_direction: SortDirection::Asc,
+                sort_key: ItemSortKey::CreatedAtOrdinal,
+                after_updated_at_ordinal: None,
             })
             .await
             .expect_err("default list_items should be unsupported");
@@ -133,6 +135,8 @@ mod tests {
                     selected_capability_roots: Vec::new(),
                     multi_agent_version: None,
                     history_mode: ThreadHistoryMode::Legacy,
+                    history_base: None,
+                    subagent_history_start_ordinal: None,
                     initial_window_id: uuid::Uuid::now_v7().to_string(),
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
@@ -144,6 +148,18 @@ mod tests {
                 .expect("create thread");
         }
 
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id: grandchild_thread_id,
+                patch: ThreadMetadataPatch {
+                    section: Some(Some(codex_state::PINNED_THREAD_SECTION_ID.to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("pin grandchild thread");
+
         let page = ThreadStore::list_threads(
             &store,
             ListThreadsParams {
@@ -154,6 +170,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)),
@@ -181,6 +198,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: Some(ThreadRelationFilter::DescendantsOf(parent_thread_id)),
@@ -197,10 +215,66 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([child_thread_id, grandchild_thread_id])
         );
+
+        let page = ThreadStore::list_threads(
+            &store,
+            ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: Some(Some(codex_state::PINNED_THREAD_SECTION_ID.to_string())),
+                archived: false,
+                search_term: None,
+                relation_filter: Some(ThreadRelationFilter::DescendantsOf(parent_thread_id)),
+                use_state_db_only: false,
+            },
+        )
+        .await
+        .expect("list pinned descendant threads");
+
+        assert_eq!(
+            page.items
+                .into_iter()
+                .map(|item| item.thread_id)
+                .collect::<Vec<_>>(),
+            vec![grandchild_thread_id]
+        );
+
+        let page = ThreadStore::list_threads(
+            &store,
+            ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: Some(None),
+                archived: false,
+                search_term: None,
+                relation_filter: Some(ThreadRelationFilter::DescendantsOf(parent_thread_id)),
+                use_state_db_only: false,
+            },
+        )
+        .await
+        .expect("list unsectioned descendant threads");
+
+        assert_eq!(
+            page.items
+                .into_iter()
+                .map(|item| item.thread_id)
+                .collect::<Vec<_>>(),
+            vec![child_thread_id]
+        );
     }
 
     #[tokio::test]
-    async fn paginated_threads_allow_metadata_reads_and_reject_legacy_history_paths() {
+    async fn paginated_threads_allow_metadata_reads_and_resume_but_reject_legacy_history_paths() {
         let store = InMemoryThreadStore::default();
         let thread_id = ThreadId::default();
         let rollout_path = PathBuf::from("/tmp/paginated-thread.jsonl");
@@ -287,18 +361,16 @@ mod tests {
                 .await
                 .expect_err("history load should fail"),
         );
-        assert_paginated_threads_unsupported(
-            store
-                .resume_thread(ResumeThreadParams {
-                    thread_id,
-                    rollout_path: None,
-                    history: None,
-                    include_archived: false,
-                    metadata: thread_metadata(),
-                })
-                .await
-                .expect_err("resume should fail"),
-        );
+        store
+            .resume_thread(ResumeThreadParams {
+                thread_id,
+                rollout_path: None,
+                history: None,
+                include_archived: false,
+                metadata: thread_metadata(),
+            })
+            .await
+            .expect("resume should succeed");
         assert_paginated_threads_unsupported(
             store
                 .create_thread(create_thread_params(
@@ -328,6 +400,8 @@ mod tests {
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode,
+            history_base: None,
+            subagent_history_start_ordinal: None,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
             metadata: thread_metadata(),
         }
@@ -444,6 +518,8 @@ impl InMemoryThreadStore {
             memory_mode: matches!(params.metadata.memory_mode, ThreadMemoryMode::Disabled)
                 .then_some("disabled".to_string()),
             history_mode: params.history_mode,
+            history_base: params.history_base,
+            subagent_history_start_ordinal: params.subagent_history_start_ordinal,
             multi_agent_version: params.multi_agent_version,
             context_window: Some(SessionContextWindow::new(params.initial_window_id.clone())),
             ..SessionMeta::default()
@@ -463,13 +539,6 @@ impl InMemoryThreadStore {
     async fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreResult<()> {
         let mut state = self.state.lock().await;
         state.calls.resume_thread += 1;
-        let history_mode = params
-            .history
-            .as_deref()
-            .map(Vec::as_slice)
-            .map(canonical_history_mode_from_rollout_items)
-            .unwrap_or_else(|| history_mode_from_state(&state, params.thread_id));
-        reject_paginated_history_mode(history_mode)?;
         if let Some(history) = params.history {
             state
                 .histories
@@ -731,6 +800,11 @@ impl ThreadStore for InMemoryThreadStore {
                 }
                 None => {}
             }
+            if let Some(section) = params.section.as_ref() {
+                page.items.retain(|thread| {
+                    thread.section.as_ref().map(|section| section.id.as_str()) == section.as_deref()
+                });
+            }
             Ok(page)
         })
     }
@@ -814,6 +888,16 @@ fn stored_thread_from_state(
             .and_then(|metadata| metadata.advance_recency_at.or(metadata.updated_at))
             .unwrap_or_else(Utc::now),
         archived_at: None,
+        section: metadata
+            .and_then(|metadata| metadata.section.clone().flatten())
+            .map(|id| codex_state::ThreadSection {
+                name: if id == codex_state::PINNED_THREAD_SECTION_ID {
+                    codex_state::PINNED_THREAD_SECTION_NAME.to_string()
+                } else {
+                    id.clone()
+                },
+                id,
+            }),
         cwd: metadata
             .and_then(|metadata| metadata.cwd.clone())
             .unwrap_or_default(),

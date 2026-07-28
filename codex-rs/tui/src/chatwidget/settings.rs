@@ -219,6 +219,7 @@ impl ChatWidget {
         self.clear_pending_token_activity_refreshes();
         self.clear_pending_rate_limit_reset_requests();
         self.codex_rate_limit_reached_type = None;
+        self.codex_spend_control_reached = None;
         self.rate_limit_warnings = RateLimitWarningState::default();
         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
         self.bottom_pane
@@ -469,6 +470,9 @@ impl ChatWidget {
         self.sync_image_paste_enabled();
         self.sync_service_tier_commands();
         self.refresh_terminal_title();
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort(effort.as_ref());
     }
 
     /// Refresh every UI surface that depends on the effective model, reasoning

@@ -2,6 +2,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_code_mode::CodeModeSessionProvider;
+use codex_code_mode::WebSocketCodeModeSessionProvider;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
@@ -54,13 +56,13 @@ use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
-use codex_config::ConstraintError;
 use codex_config::TextRange as CoreTextRange;
 use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::state_db as rollout_state_db;
@@ -86,6 +88,7 @@ mod app_server_tracing;
 mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
+mod code_mode_host;
 mod command_exec;
 mod config_layer;
 mod config_manager;
@@ -117,6 +120,8 @@ mod thread_state;
 mod thread_status;
 mod transport;
 
+pub use crate::code_mode_host::AppServerCodeModeHostArgs;
+pub use crate::code_mode_host::CodeModeHostTransport;
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
@@ -301,12 +306,6 @@ fn config_error_location(err: &std::io::Error) -> Option<(String, AppTextRange)>
         })
 }
 
-fn is_unrecoverable_windows_network_config_error(err: &std::io::Error) -> bool {
-    err.get_ref()
-        .and_then(|source| source.downcast_ref::<ConstraintError>())
-        .is_some_and(ConstraintError::is_windows_network_configuration_error)
-}
-
 fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Option<AppTextRange>) {
     match err {
         ExecPolicyError::ParsePolicy { path, source } => {
@@ -435,8 +434,9 @@ pub enum PluginStartupTasks {
     Skip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
+    pub code_mode_host_transport: CodeModeHostTransport,
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
@@ -445,6 +445,7 @@ pub struct AppServerRuntimeOptions {
 impl Default for AppServerRuntimeOptions {
     fn default() -> Self {
         Self {
+            code_mode_host_transport: CodeModeHostTransport::Local,
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
@@ -487,13 +488,7 @@ pub async fn run_main_with_transport_options(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
-    let environment_manager = if loader_overrides.ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths)).await
-    } else {
-        EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
-    }
-    .map(Arc::new)
-    .map_err(std::io::Error::other)?;
+    let ignore_user_config = loader_overrides.ignore_user_config;
     let config_manager = ConfigManager::new(
         codex_home.to_path_buf(),
         cli_kv_overrides.clone(),
@@ -504,7 +499,7 @@ pub async fn run_main_with_transport_options(
         Arc::new(NoopThreadConfigLoader),
     );
     match config_manager
-        .load_config_for_cloud_config_bootstrap()
+        .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => {
@@ -513,8 +508,11 @@ pub async fn run_main_with_transport_options(
                 .replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
             let auth_manager =
                 AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-            config_manager
-                .replace_cloud_config_bundle_loader(auth_manager, config.chatgpt_base_url);
+            config_manager.replace_cloud_config_bundle_loader(
+                auth_manager,
+                config.chatgpt_base_url.clone(),
+                config.http_client_factory(),
+            );
         }
         Err(err) => {
             warn!(error = %err, "Failed to preload config for cloud config bundle");
@@ -530,7 +528,7 @@ pub async fn run_main_with_transport_options(
     {
         Ok(config) => config,
         Err(err) => {
-            if strict_config || is_unrecoverable_windows_network_config_error(&err) {
+            if strict_config {
                 return Err(err);
             }
 
@@ -544,6 +542,36 @@ pub async fn run_main_with_transport_options(
             })?
         }
     };
+    let code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>> =
+        match &runtime_options.code_mode_host_transport {
+            CodeModeHostTransport::Local => None,
+            CodeModeHostTransport::WebSocket(url) => {
+                if !config.features.enabled(Feature::CodeModeHost) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "remote code-mode host requires the code_mode_host feature to be enabled",
+                    ));
+                }
+                Some(Arc::new(
+                    WebSocketCodeModeSessionProvider::with_http_client_factory(
+                        url.to_string(),
+                        config.http_client_factory(),
+                    ),
+                ))
+            }
+        };
+    let environment_manager = if ignore_user_config {
+        EnvironmentManager::from_env(Some(local_runtime_paths), config.http_client_factory()).await
+    } else {
+        EnvironmentManager::from_codex_home(
+            codex_home.clone(),
+            Some(local_runtime_paths),
+            config.http_client_factory(),
+        )
+        .await
+    }
+    .map(Arc::new)
+    .map_err(std::io::Error::other)?;
 
     let otel = codex_core::otel_init::build_provider(
         &config,
@@ -573,7 +601,7 @@ pub async fn run_main_with_transport_options(
         Err(err) => {
             return Err(std::io::Error::other(format!(
                 "failed to initialize sqlite state runtime under {}: {err}",
-                config.sqlite_home.display()
+                config.sqlite_config().home().display()
             )));
         }
     };
@@ -867,6 +895,7 @@ pub async fn run_main_with_transport_options(
             session_source,
             auth_manager,
             installation_id,
+            code_mode_session_provider,
             rpc_transport: analytics_rpc_transport(&transport),
             remote_control_handle: Some(remote_control_handle.clone()),
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
@@ -1201,7 +1230,7 @@ async fn init_sqlite_state_db_with_fresh_start_on_corruption(
             Err(err) => err,
         };
         let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
-            .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
+            .unwrap_or_else(|| config.sqlite_config().state_db_path());
         if !codex_state::is_sqlite_corruption_error(&err)
             && !sqlite_home_is_blocking_file(database_path.as_path())
         {
@@ -1330,62 +1359,13 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 #[cfg(test)]
 mod tests {
     use super::LogFormat;
-    #[cfg(target_os = "windows")]
-    use super::is_unrecoverable_windows_network_config_error;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
-    #[cfg(target_os = "windows")]
-    use crate::config_manager::ConfigManager;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
-
-    #[cfg(target_os = "windows")]
-    #[tokio::test]
-    async fn cloud_config_bootstrap_defers_network_validation_and_preserves_cli_overrides() {
-        let codex_home = tempfile::tempdir().expect("create Codex home");
-        std::fs::write(
-            codex_home.path().join(codex_config::CONFIG_TOML_FILE),
-            r#"
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-network_access = true
-
-[features]
-network_proxy = true
-
-[windows]
-sandbox = "elevated"
-"#,
-        )
-        .expect("write config");
-        let chatgpt_base_url = "https://cloud-config.example.test".to_string();
-        let config_manager = ConfigManager::new_for_tests(
-            codex_home.path().to_path_buf(),
-            vec![(
-                "chatgpt_base_url".to_string(),
-                toml::Value::String(chatgpt_base_url.clone()),
-            )],
-            codex_config::LoaderOverrides::without_managed_config_for_tests(),
-            codex_config::CloudConfigBundleLoader::default(),
-        );
-
-        let config = config_manager
-            .load_config_for_cloud_config_bootstrap()
-            .await
-            .expect("bootstrap config should defer Windows network validation");
-        assert_eq!(config.chatgpt_base_url, chatgpt_base_url);
-        assert!(config.permissions.network.is_some());
-
-        let err = config_manager
-            .load_latest_config(/*fallback_cwd*/ None)
-            .await
-            .expect_err("authoritative config should enforce Windows network validation");
-        assert!(is_unrecoverable_windows_network_config_error(&err));
-    }
 
     #[test]
     fn log_format_from_env_value_matches_json_values_case_insensitively() {
