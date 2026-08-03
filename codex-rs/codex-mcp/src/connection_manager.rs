@@ -23,6 +23,7 @@ pub use tool_catalog::tool_is_model_visible;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -144,6 +145,7 @@ impl McpServerView {
 pub(crate) struct McpConnectionSet {
     servers: HashMap<String, McpServerView>,
     required_servers: Vec<String>,
+    optional_startup_deadline: OnceLock<tokio::time::Instant>,
     tool_catalog_revision: Arc<RwLock<u64>>,
     codex_apps_tools_override: RwLock<Option<Vec<ToolInfo>>>,
     codex_apps_refresh_lock: Mutex<()>,
@@ -417,7 +419,9 @@ impl McpConnectionSet {
                                     env_http_headers,
                                 } => {
                                     match determine_streamable_http_auth_status_from_credentials(
-                                        &server_name,
+                                        configured_config
+                                            .oauth_credential_name(&server_name)
+                                            .as_ref(),
                                         url,
                                         bearer_token_env_var.as_deref(),
                                         http_headers.clone(),
@@ -483,6 +487,7 @@ impl McpConnectionSet {
         let manager = Self {
             servers,
             required_servers,
+            optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
             codex_apps_tools_override: RwLock::new(None),
             codex_apps_refresh_lock: Mutex::new(()),
@@ -540,6 +545,7 @@ impl McpConnectionSet {
         Self {
             servers: HashMap::new(),
             required_servers: Vec::new(),
+            optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
             codex_apps_tools_override: RwLock::new(None),
             codex_apps_refresh_lock: Mutex::new(()),

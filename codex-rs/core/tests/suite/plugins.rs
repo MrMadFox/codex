@@ -6,7 +6,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use codex_core::config::Config;
 use codex_core_plugins::store::PluginStore;
+use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -19,6 +22,8 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::SkillsExtensionConfig;
+use codex_skills_extension::install;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_CREATE_TOOL;
 use core_test_support::responses::ResponseMock;
@@ -45,6 +50,7 @@ use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
 use wiremock::MockServer;
 
 const SAMPLE_PLUGIN_CONFIG_NAME: &str = "sample@test";
@@ -57,6 +63,17 @@ const SAMPLE_PLUGIN_MCP_NAMESPACE: &str = "mcp__sample";
 const PLUGIN_APP_SEARCH_CALL_ID: &str = "plugin-app-search";
 const PLUGIN_MCP_SEARCH_CALL_ID: &str = "plugin-mcp-search";
 const REMOTE_PLUGIN_CONFIG_NAME: &str = "sample@openai-curated-remote";
+
+fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        include_instructions: config.include_skill_instructions,
+        bundled_skills_enabled: config.bundled_skills_enabled(),
+        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+    });
+    Arc::new(extensions.build())
+}
 
 fn sample_plugin_root(home: &TempDir) -> std::path::PathBuf {
     home.path().join("plugins/cache/test/sample/local")
@@ -164,6 +181,28 @@ fn write_plugin_mcp_plugin(home: &TempDir, command: &str) {
         ),
     )
     .expect("write plugin mcp config");
+}
+
+fn block_plugin_mcp_startup(home: &TempDir, command: &str) -> std::path::PathBuf {
+    let barrier = home.path().join("allow-plugin-initialize");
+    std::fs::write(
+        sample_plugin_root(home).join(".mcp.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "mcpServers": {
+                "sample": {
+                    "command": command,
+                    "cwd": ".",
+                    "env": {
+                        "MCP_TEST_INITIALIZE_BARRIER_FILE": barrier,
+                    },
+                    "startup_timeout_sec": 10,
+                },
+            },
+        }))
+        .expect("serialize blocked plugin MCP configuration"),
+    )
+    .expect("write blocked plugin MCP configuration");
+    barrier
 }
 
 fn write_plugin_app_plugin(home: &TempDir) {
@@ -385,12 +424,18 @@ async fn capability_sections_render_in_developer_message_in_order() -> Result<()
     let codex_home = Arc::new(TempDir::new()?);
     write_plugin_skill_plugin(codex_home.as_ref());
     write_plugin_app_plugin(codex_home.as_ref());
-    let test_codex = build_apps_enabled_plugin_test_codex(
-        &server,
-        Arc::clone(&codex_home),
-        apps_server.chatgpt_base_url,
-    )
-    .await?;
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&codex_home))
+        .with_extensions(skills_extensions())
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::Apps)
+                .expect("test config should allow feature update");
+            config.chatgpt_base_url = apps_server.chatgpt_base_url;
+        });
+    let test_codex = builder.build(&server).await?;
     let codex = Arc::clone(&test_codex.codex);
 
     codex
@@ -622,6 +667,7 @@ enabled = true
 
         let mut builder = test_codex()
             .with_home(Arc::clone(&codex_home))
+            .with_extensions(skills_extensions())
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let test_codex = builder.build_with_auto_env(&server).await?;
         let plugins_manager = test_codex.thread_manager.plugins_manager();
@@ -836,8 +882,20 @@ async fn explicit_plugin_mentions_keep_non_conflicting_mcp_for_chatgpt_auth() ->
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ExplicitMcpRequest {
+    Plugin,
+    PluginSkill,
+    ServerMention,
+    LinkedServerMention,
+}
+
+#[test_case(ExplicitMcpRequest::Plugin; "plugin mention")]
+#[test_case(ExplicitMcpRequest::PluginSkill; "plugin skill")]
+#[test_case(ExplicitMcpRequest::ServerMention; "MCP server mention")]
+#[test_case(ExplicitMcpRequest::LinkedServerMention; "linked MCP server mention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_plugin_mentions_use_mcp_for_api_key_dual_surface_plugins() -> Result<()> {
+async fn explicitly_requested_mcp_waits_for_startup(request: ExplicitMcpRequest) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let mock = mount_plugin_tool_search_turn(&server).await;
@@ -850,9 +908,10 @@ async fn explicit_plugin_mentions_use_mcp_for_api_key_dual_surface_plugins() -> 
             return Ok(());
         }
     };
-    write_plugin_skill_plugin(codex_home.as_ref());
+    let skill_path = std::fs::canonicalize(write_plugin_skill_plugin(codex_home.as_ref()))?;
     write_plugin_mcp_plugin(codex_home.as_ref(), &rmcp_test_server_bin);
     write_plugin_app_plugin(codex_home.as_ref());
+    let initialize_barrier = block_plugin_mcp_startup(codex_home.as_ref(), &rmcp_test_server_bin);
 
     let mut builder = test_codex()
         .with_home(codex_home)
@@ -868,37 +927,68 @@ async fn explicit_plugin_mentions_use_mcp_for_api_key_dual_surface_plugins() -> 
         .await
         .expect("create new conversation");
     let codex = Arc::clone(&test_codex.codex);
-    wait_for_mcp_server(&codex, "sample").await?;
 
+    let input = match request {
+        ExplicitMcpRequest::Plugin => UserInput::Mention {
+            name: "sample".into(),
+            path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
+        },
+        ExplicitMcpRequest::PluginSkill => UserInput::Skill {
+            name: "sample:sample-search".into(),
+            path: skill_path,
+        },
+        ExplicitMcpRequest::ServerMention => UserInput::Mention {
+            name: "sample".into(),
+            path: "mcp://sample".into(),
+        },
+        ExplicitMcpRequest::LinkedServerMention => UserInput::Text {
+            text: "use [$sample](mcp://sample)".to_string(),
+            text_elements: Vec::new(),
+        },
+    };
     codex
         .submit(Op::UserInput {
-            items: vec![codex_protocol::user_input::UserInput::Mention {
-                name: "sample".into(),
-                path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
-            }],
+            items: vec![input],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
             thread_settings: Default::default(),
         })
         .await?;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        mock.requests().is_empty(),
+        "an explicitly requested MCP should finish starting before inference"
+    );
+    std::fs::write(initialize_barrier, "ready")?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = mock.requests();
-    let request = &requests[0];
-    let developer_messages = request.message_input_texts("developer");
-    assert!(
-        developer_messages
-            .iter()
-            .any(|text| text.contains("Skills from this plugin")),
-        "expected plugin skills guidance: {developer_messages:?}"
-    );
-    assert!(
-        developer_messages
-            .iter()
-            .any(|text| text.contains("MCP servers from this plugin")),
-        "expected visible plugin MCP guidance: {developer_messages:?}"
-    );
+    let model_request = &requests[0];
+    let developer_messages = model_request.message_input_texts("developer");
+    if matches!(request, ExplicitMcpRequest::Plugin) {
+        assert!(
+            developer_messages
+                .iter()
+                .any(|text| text.contains("Skills from this plugin")),
+            "expected plugin skills guidance: {developer_messages:?}"
+        );
+        assert!(
+            developer_messages
+                .iter()
+                .any(|text| text.contains("MCP servers from this plugin")),
+            "expected visible plugin MCP guidance: {developer_messages:?}"
+        );
+    }
+    if matches!(request, ExplicitMcpRequest::PluginSkill) {
+        let user_messages = model_request.message_input_texts("user");
+        assert!(
+            user_messages
+                .iter()
+                .any(|message| message.contains("sample:sample-search")),
+            "expected explicitly requested skill instructions: {user_messages:?}"
+        );
+    }
     assert!(
         !developer_messages
             .iter()
@@ -906,7 +996,7 @@ async fn explicit_plugin_mentions_use_mcp_for_api_key_dual_surface_plugins() -> 
         "expected plugin app guidance to be suppressed for API-key auth: {developer_messages:?}"
     );
     assert!(
-        request
+        model_request
             .tool_by_name(SAMPLE_PLUGIN_APP_NAMESPACE, SEARCH_CALENDAR_CREATE_TOOL)
             .is_none(),
         "plugin app tool should not leak into the request for API-key auth"
