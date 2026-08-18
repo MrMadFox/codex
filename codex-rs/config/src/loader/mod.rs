@@ -71,6 +71,7 @@ const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "openai_base_url",
     "chatgpt_base_url",
     "apps_mcp_product_sku",
+    "responses_api_metadata",
     "model_provider",
     "model_providers",
     "notify",
@@ -93,14 +94,16 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 /// - system    `/etc/codex/requirements.toml` (Unix) or
 ///   `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
 /// - cloud:    enterprise-managed cloud config bundle requirements
-/// - legacy:   managed_config.toml reinterpreted as requirements.toml
+/// - legacy:   `/etc/codex/managed_config.toml` (Unix) reinterpreted as
+///   requirements.toml
 /// - admin:    managed preferences (*)
 ///
-/// For backwards compatibility, we also load from
-/// `managed_config.toml` and map it to `requirements.toml`.
+/// For backwards compatibility, Unix continues to load
+/// `/etc/codex/managed_config.toml` and map it to `requirements.toml`.
 ///
 /// Configuration is built up from multiple layers in the following order:
 ///
+/// - package:  optional default configuration supplied with the Codex package
 /// - admin:    managed preferences (*)
 /// - system    `/etc/codex/config.toml` (Unix) or
 ///   `%ProgramData%\OpenAI\Codex\config.toml` (Windows)
@@ -134,9 +137,53 @@ pub async fn load_config_layers_state(
         strict_config,
         cloud_config_bundle,
     } = options.into();
+    let packaged_defaults_layer = if let Some(file) = &overrides.packaged_defaults_path {
+        let config = layer_io::read_config_from_path(
+            fs,
+            file,
+            /*log_missing_as_info*/ false,
+            strict_config,
+        )
+        .await?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("packaged defaults config file {} not found", file.display()),
+            )
+        })?;
+        let base_dir = file.as_path().parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "packaged defaults config file {} has no parent directory",
+                    file.display()
+                ),
+            )
+        })?;
+        ConfigLayerEntry::new(
+            ConfigLayerSource::PackagedDefaults { file: file.clone() },
+            resolve_relative_paths_in_config_toml(config, base_dir)?,
+        )
+    } else {
+        let file = AbsolutePathBuf::from_absolute_path(std::env::current_exe()?)?;
+        let raw_toml = include_str!("../../defaults.toml");
+        let config = toml::from_str(raw_toml).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid embedded packaged defaults; this is a Codex build error: {error}"),
+            )
+        })?;
+        ConfigLayerEntry::new_with_raw_toml(
+            ConfigLayerSource::PackagedDefaults { file },
+            config,
+            raw_toml.to_owned(),
+            AbsolutePathBuf::from_absolute_path(codex_home)?,
+        )
+    };
     let active_user_profile = overrides.user_config_profile.clone();
     let ignore_managed_requirements = true;
     let ignore_user_config = overrides.ignore_user_config;
+    let ignore_project_config = overrides.ignore_project_config;
     let ignore_user_and_project_exec_policy_rules =
         overrides.ignore_user_and_project_exec_policy_rules;
     let mut requirements_layers = Vec::new();
@@ -187,10 +234,12 @@ pub async fn load_config_layers_state(
     let loaded_config_layers =
         layer_io::load_config_layers_internal(fs, codex_home, overrides.clone(), strict_config)
             .await?;
+    let mut startup_warnings = (!loaded_config_layers.startup_warnings.is_empty())
+        .then(|| loaded_config_layers.startup_warnings.clone());
     if !ignore_managed_requirements {
         requirements_layers.extend(system_requirements_layer);
         requirements_layers.extend(bundle_requirements_layers);
-        // Continue to support the legacy `managed_config.toml` locations as
+        // Continue to support loaded legacy `managed_config.toml` sources as
         // requirements layers for backwards compatibility.
         requirements_layers.extend(requirements_layers_from_legacy_scheme(
             loaded_config_layers.clone(),
@@ -218,6 +267,7 @@ pub async fn load_config_layers_state(
         .map_err(io::Error::other)?;
 
     let mut layers = Vec::<ConfigLayerEntry>::new();
+    layers.push(packaged_defaults_layer);
 
     let cli_overrides_layer = if cli_overrides.is_empty() {
         None
@@ -306,8 +356,7 @@ pub async fn load_config_layers_state(
         );
     }
 
-    let mut startup_warnings = None;
-    if let Some(cwd) = cwd {
+    if !ignore_project_config && let Some(cwd) = cwd {
         let mut merged_so_far = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
             merge_toml_values(&mut merged_so_far, &layer.config);
@@ -365,7 +414,9 @@ pub async fn load_config_layers_state(
         )
         .await?;
         layers.extend(project_layers.layers);
-        startup_warnings = Some(project_layers.startup_warnings);
+        startup_warnings
+            .get_or_insert_with(Vec::new)
+            .extend(project_layers.startup_warnings);
     }
 
     // Add a layer for runtime overrides from the CLI or UI, if any exist.
@@ -388,6 +439,7 @@ pub async fn load_config_layers_state(
     let LoadedConfigLayers {
         managed_config,
         managed_config_from_mdm,
+        ..
     } = loaded_config_layers;
     if let Some(config) = managed_config {
         let managed_parent = config.file.as_path().parent().ok_or_else(|| {
@@ -684,6 +736,42 @@ fn system_requirements_toml_file_with_overrides(
     }
 }
 
+/// Check local managed configuration sources without loading or parsing configuration.
+///
+/// Filesystem or managed-preference errors are returned so callers can conservatively avoid
+/// assuming that administrator-controlled configuration is absent.
+pub fn has_local_managed_configuration(codex_home: &Path) -> io::Result<bool> {
+    let system_requirements_file = system_requirements_toml_file()?;
+    has_local_managed_configuration_with_system_requirements_path(
+        codex_home,
+        system_requirements_file.as_path(),
+    )
+}
+
+fn has_local_managed_configuration_with_system_requirements_path(
+    codex_home: &Path,
+    system_requirements_path: &Path,
+) -> io::Result<bool> {
+    #[cfg(windows)]
+    let _ = codex_home;
+
+    #[cfg(not(windows))]
+    if layer_io::managed_config_default_path(codex_home).try_exists()? {
+        return Ok(true);
+    }
+
+    if system_requirements_path.try_exists()? {
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    if macos::has_managed_preferences()? {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 #[cfg(unix)]
 pub fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(Path::new(SYSTEM_CONFIG_TOML_FILE_UNIX))
@@ -786,6 +874,7 @@ fn requirements_layers_from_legacy_scheme(
     let LoadedConfigLayers {
         managed_config,
         managed_config_from_mdm,
+        ..
     } = loaded_config_layers;
 
     let layer_count =
