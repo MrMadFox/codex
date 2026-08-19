@@ -2053,10 +2053,10 @@ dependencies = [
  "flate2",
  "futures",
  "hmac 0.12.1",
+ "http 1.4.0",
  "opentelemetry",
  "opentelemetry_sdk",
  "pretty_assertions",
- "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
@@ -3179,14 +3179,17 @@ name = "codex-feedback"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-http-client",
  "codex-login",
  "codex-protocol",
  "log",
  "mime_guess",
  "pretty_assertions",
  "sentry",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -3309,7 +3312,6 @@ dependencies = [
  "codex-core",
  "codex-extension-api",
  "codex-features",
- "codex-history",
  "codex-http-client",
  "codex-login",
  "codex-model-provider",
