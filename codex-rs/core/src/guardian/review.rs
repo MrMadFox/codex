@@ -5,6 +5,7 @@ use codex_analytics::GuardianReviewFailureReason;
 use codex_analytics::GuardianReviewTerminalStatus;
 use codex_analytics::GuardianReviewTrackContext;
 use codex_analytics::GuardianReviewedAction;
+use codex_async_utils::THREAD_STACK_SIZE_BYTES;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_extension_api::ThreadIdleCause;
 use codex_features::Feature;
@@ -32,6 +33,7 @@ use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 
+use crate::context::GuardianNodeReplPolicy;
 use crate::context::GuardianReviewEvidence;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -322,7 +324,8 @@ async fn run_guardian_review(
     options: GuardianReviewOptions,
 ) -> ReviewDecision {
     let turn = Arc::clone(context.turn());
-    let requires_synchronous_review = reasons.retry.is_some()
+    let requires_synchronous_review = options.require_synchronous_review
+        || reasons.retry.is_some()
         || matches!(
             &request,
             GuardianApprovalRequest::ExecCommand {
@@ -331,7 +334,8 @@ async fn run_guardian_review(
             } if sandbox_permissions.requires_escalated_permissions()
         );
     // Guardian V2 may satisfy ordinary reviews, including required-model reviews, but broader
-    // permission requests and retries must run Guardian synchronously.
+    // permission requests, retries, and elicitations requiring synchronous review must not use
+    // extension fast approval.
     if (!turn
         .config
         .config_layer_stack
@@ -368,6 +372,7 @@ async fn run_guardian_review(
         plugin_attribution_override,
         approval_request_source,
         external_cancel,
+        require_synchronous_review: _,
     } = options;
     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
@@ -739,6 +744,8 @@ pub(crate) struct GuardianReviewOptions {
     pub(crate) plugin_attribution_override: Option<PluginCommandAttribution>,
     pub(crate) approval_request_source: GuardianApprovalRequestSource,
     pub(crate) external_cancel: Option<CancellationToken>,
+    /// Escalate from extension fast approval to the synchronous Guardian reviewer.
+    pub(crate) require_synchronous_review: bool,
 }
 
 /// Public entrypoint for approval requests that should be reviewed by guardian.
@@ -760,6 +767,7 @@ pub(crate) async fn review_approval_request(
             plugin_attribution_override: None,
             approval_request_source: GuardianApprovalRequestSource::MainTurn,
             external_cancel: None,
+            require_synchronous_review: false,
         },
     ));
     review.await
@@ -800,6 +808,7 @@ pub(crate) fn spawn_approval_request_review(
     let runtime = session.services.runtime_handle.clone();
     let spawn_result = std::thread::Builder::new()
         .name("codex-approval-review".to_string())
+        .stack_size(THREAD_STACK_SIZE_BYTES)
         .spawn(move || {
             let decision = runtime.block_on(run_guardian_review(
                 session, context, review_id, request, reasons, options,
@@ -814,6 +823,7 @@ pub(crate) fn spawn_approval_request_review(
 
 pub(super) struct GuardianReviewSessionConfig {
     pub(super) spawn_config: crate::config::Config,
+    pub(super) node_repl_policy: GuardianNodeReplPolicy,
     model: String,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     default_review_model_id: String,
@@ -915,6 +925,9 @@ pub(super) async fn guardian_review_session_config(
     }
     Ok(GuardianReviewSessionConfig {
         spawn_config,
+        node_repl_policy: GuardianNodeReplPolicy::from_model_messages(
+            guardian_model_info.model_messages.as_ref(),
+        ),
         model: guardian_model,
         reasoning_effort: guardian_reasoning_effort,
         default_review_model_id: default_review_model_id.to_string(),
@@ -965,6 +978,7 @@ async fn run_guardian_review_session_before_deadline(
                 parent_session: Arc::clone(&session),
                 parent_context: context.clone(),
                 spawn_config: session_config.spawn_config,
+                node_repl_policy: session_config.node_repl_policy,
                 request,
                 reasons,
                 schema,

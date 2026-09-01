@@ -17,6 +17,7 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::tools::ApprovalContext;
 use crate::tools::hook_names::HookToolName;
+use crate::tools::lifecycle::process_mcp_tool_result;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ToolError;
 use crate::turn_metadata::McpTurnMetadataContext;
@@ -29,6 +30,7 @@ use codex_config::types::AppToolApproval;
 use codex_connectors::AppToolPolicy;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_connectors::AppToolPolicyInput;
+use codex_extension_api::McpToolContext;
 use codex_features::Feature;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
@@ -94,8 +96,10 @@ use tracing::error;
 use tracing::field::Empty;
 use url::Url;
 
+mod account;
 mod telemetry;
 
+use account::McpToolAccountError;
 use telemetry::McpCallMetricOutcome;
 use telemetry::emit_mcp_call_metrics;
 use telemetry::mcp_call_metric_outcome;
@@ -171,13 +175,39 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     };
-    let metadata = mcp_tool_metadata(&prepared_call);
+    let metadata = match mcp_tool_metadata(
+        prepared_call.tool_info(),
+        prepared_call.plugin_id(),
+        invocation.arguments.as_ref(),
+    ) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            let item_metadata =
+                McpToolCallItemMetadata::from_tool_metadata(&server, /*metadata*/ None);
+            let result = notify_mcp_tool_call_skip(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &call_id,
+                invocation,
+                item_metadata,
+                err.to_string(),
+                /*already_started*/ false,
+            )
+            .await;
+            return HandledMcpToolCall {
+                result: CallToolResult::from_result(result),
+                tool_input: arguments_value
+                    .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+            };
+        }
+    };
     let item_metadata = McpToolCallItemMetadata::from_tool_metadata(&server, Some(&metadata));
     let runtime_config = prepared_call.config();
     let app_tool_policy = if server == CODEX_APPS_MCP_SERVER_NAME {
         let annotations = metadata.annotations.as_ref();
         AppToolPolicyEvaluator::new(&runtime_config.config_layer_stack).policy(AppToolPolicyInput {
             connector_id: metadata.connector_id.as_deref(),
+            link_id: metadata.link_id.as_deref(),
             tool_name: &tool_name,
             tool_title: metadata.tool_title.as_deref(),
             destructive_hint: annotations.and_then(|annotations| annotations.destructive_hint),
@@ -422,7 +452,7 @@ async fn handle_approved_mcp_tool_call(
         .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
     let result = async {
         let result = async {
-            let result = prepared_call
+            let mut result = prepared_call
                 .call_with_preparation(/*requested_timeout*/ None, || async {
                     if let McpToolApprovalApplication::Apply { decision, policy } =
                         &approval_application
@@ -501,6 +531,19 @@ async fn handle_approved_mcp_tool_call(
                 })
                 .await
                 .map_err(|error| format!("tool call error: {error:?}"))?;
+            let mcp_tool = McpToolContext::from_prepared_call(
+                &prepared_call,
+                turn_context.config.mcp_servers.get().get(&server),
+            );
+            process_mcp_tool_result(
+                sess,
+                turn_context,
+                call_id,
+                &mcp_tool,
+                &tool_input,
+                &mut result,
+            )
+            .await;
             let result = sanitize_mcp_tool_result_for_model(
                 &turn_context.model_info().input_modalities,
                 Ok(result),
@@ -1111,7 +1154,9 @@ impl Session {
         };
         turn_state.lock().await.insert_mcp_tool_approval_metadata(
             call_id.to_string(),
-            (invocation.server == CODEX_APPS_MCP_SERVER_NAME).then(|| invocation.clone()),
+            (invocation.server == CODEX_APPS_MCP_SERVER_NAME
+                || is_node_repl_backed_server(&invocation.server))
+            .then(|| invocation.clone()),
             metadata,
         );
     }
@@ -1369,10 +1414,14 @@ async fn maybe_request_mcp_tool_approval(
     };
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
-        config.approvals_reviewer,
+        step_context
+            .settings
+            .mcp_approvals_reviewer_override
+            .unwrap_or(config.approvals_reviewer),
         Some(turn_context.model_info().slug.as_str()),
         &invocation.server,
         metadata.connector_id.as_deref(),
+        metadata.link_id.as_deref(),
     );
     if !strict_auto_review
         && mcp_permission_prompt_is_auto_approved(
@@ -1627,9 +1676,13 @@ pub(crate) fn build_guardian_mcp_tool_review_request(
     }
 }
 
-fn mcp_tool_metadata(prepared_call: &PreparedMcpCall) -> McpToolApprovalMetadata {
-    let server = prepared_call.server_name();
-    let tool_info = prepared_call.tool_info().clone();
+fn mcp_tool_metadata(
+    tool_info: &ToolInfo,
+    plugin_id: Option<&str>,
+    arguments: Option<&JsonValue>,
+) -> Result<McpToolApprovalMetadata, McpToolAccountError> {
+    let server = tool_info.server_name.as_str();
+    let tool_info = tool_info.clone();
     let connector_description = (server == CODEX_APPS_MCP_SERVER_NAME)
         .then(|| tool_info.namespace_description.clone())
         .flatten();
@@ -1641,6 +1694,11 @@ fn mcp_tool_metadata(prepared_call: &PreparedMcpCall) -> McpToolApprovalMetadata
         .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY))
         .and_then(serde_json::Value::as_object)
         .cloned();
+    let link_id = if server == CODEX_APPS_MCP_SERVER_NAME {
+        account::resolve_account(&tool_info, arguments)?
+    } else {
+        None
+    };
     let connected_account_email = if server == CODEX_APPS_MCP_SERVER_NAME {
         codex_apps_meta
             .as_ref()
@@ -1653,20 +1711,14 @@ fn mcp_tool_metadata(prepared_call: &PreparedMcpCall) -> McpToolApprovalMetadata
         None
     };
 
-    McpToolApprovalMetadata {
+    Ok(McpToolApprovalMetadata {
         annotations: tool_info.tool.annotations,
         connector_id: tool_info.connector_id,
-        link_id: tool_info
-            .tool
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get(MCP_TOOL_LINK_ID_META_KEY))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
+        link_id,
         connector_name: tool_info.connector_name,
         connector_description,
         connected_account_email,
-        plugin_id: prepared_call.plugin_id().map(str::to_string),
+        plugin_id: plugin_id.map(str::to_string),
         tool_title: tool_info.tool.title,
         tool_description: tool_info.tool.description.map(std::borrow::Cow::into_owned),
         mcp_app_resource_uri: get_mcp_app_resource_uri(tool_info.tool.meta.as_deref()),
@@ -1676,7 +1728,7 @@ fn mcp_tool_metadata(prepared_call: &PreparedMcpCall) -> McpToolApprovalMetadata
             server,
             &tool_info.openai_file_input_optional_fields,
         ),
-    }
+    })
 }
 
 fn openai_file_input_optional_fields_for_server(
